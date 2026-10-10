@@ -1,0 +1,4 @@
+anthropic>=1.13
+pymupdf>=1.28
+pillow>=12
+openpyxl>=3.1
