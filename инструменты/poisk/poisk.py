@@ -23,6 +23,7 @@ import tomllib
 
 import anthropic
 import pymupdf
+from PIL import Image
 from anthropic.types.messages.batch_create_params import Request
 
 import candidates as C
@@ -350,6 +351,82 @@ def cmd_verify(cfg, st, args):
                 print(f"  {mark} {r['name']} стр. {r['page']} {r['target']}: {str(text)[:100]}")
 
 
+# ---------- проверка без API: экспорт кандидатов → вердикты вручную (Claude Code) → импорт ----------
+
+def review_dir(cfg):
+    d = cfg["work"] / "проверка"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def cmd_review_export(cfg, st, args):
+    """Вырезки непроверенных кандидатов в работа/проверка/<id>.jpg (шапка страницы + область) и очередь.md."""
+    scan_model = args.scan_model or cfg["models"]["scan"]
+    rows = st.q("SELECT c.*, d.path, d.name FROM candidates c JOIN docs d ON d.id=c.doc_id"
+                " WHERE c.model=? AND c.status IN (" + ("'new','error','confirmed','rejected'" if args.again else "'new','error'")
+                + ") ORDER BY d.name, c.page, c.y", scan_model)
+    if args.doc:
+        rows = [r for r in rows if r["name"] == pathlib.Path(args.doc).name]
+    if args.limit:
+        rows = rows[:args.limit]
+    if not rows:
+        print("Нет кандидатов для проверки.")
+        return
+    out = review_dir(cfg)
+    pdfs, lines = {}, ["# Очередь проверки", "", "| id | файл | стр. PDF | объект | что нашёл поиск |", "|---|---|---|---|---|"]
+    for (path, pno), group in group_by(rows, lambda r: (r["path"], r["page"])).items():
+        pdf = pdfs.setdefault(path, pymupdf.open(path))
+        img = P.render_page(pdf, pno, autocontrast=False)
+        header = P.crop(img, (0, 0, img.width, round(img.height * 0.09)))[0]
+        for r in group:
+            region, box = P.crop(img, (r["x"], r["y"], r["w"], r["h"]), pad=150)
+            big, _ = P.upscale(region, 1800)
+            if box[1] >= header.height:
+                h2 = header.resize((big.width, max(1, round(header.height * big.width / header.width))))
+                canvas = Image.new("RGB", (big.width, h2.height + 12 + big.height), "red")
+                canvas.paste(h2, (0, 0))
+                canvas.paste(big, (0, h2.height + 12))
+                big = canvas
+
+            big.save(out / f"{r['id']}.jpg", quality=85)
+            lines.append(f"| {r['id']} | {r['name']} | {r['page']} | {r['target']} | {r['quote'][:80]} |")
+    (out / "очередь.md").write_text("\n".join(lines), encoding="utf-8")
+    tpl = out / "вердикты.json"
+    if not tpl.exists():
+        tpl.write_text("{}", encoding="utf-8")
+    print(f"Экспортировано {len(rows)} кандидатов в {out}")
+    print("Дальше: Claude Code читает картинки и заполняет вердикты.json, затем: poisk.py review-import")
+
+
+def cmd_review_import(cfg, st, args):
+    """Применить работа/проверка/вердикты.json: {"<id>": {"found": true, "quote": ..., ...}, ...}"""
+    src = review_dir(cfg) / "вердикты.json"
+    data = json.loads(src.read_text(encoding="utf-8") or "{}")
+    if not data:
+        print("вердикты.json пуст.")
+        return
+    frag_dir = cfg["work"] / "фрагменты"
+    (frag_dir / "отклонено").mkdir(parents=True, exist_ok=True)
+    pdfs, done = {}, 0
+    for cid, v in data.items():
+        rows = st.q("SELECT c.*, d.path, d.name FROM candidates c JOIN docs d ON d.id=c.doc_id WHERE c.id=?", int(cid))
+        if not rows:
+            print(f"  id {cid}: нет такого кандидата")
+            continue
+        r = rows[0]
+        ok = bool(v.get("found"))
+        pdf = pdfs.setdefault(r["path"], pymupdf.open(r["path"]))
+        img = P.render_page(pdf, r["page"], autocontrast=False)
+        region, box = P.crop(img, (r["x"], r["y"], r["w"], r["h"]), pad=150)
+        frag = save_fragment(frag_dir if ok else frag_dir / "отклонено", r, img, region, box, 1.0, [])
+        v.setdefault("certainty", "medium")
+        st.x("UPDATE candidates SET status=?, verify_model=?, verdict=?, fragment=?, in_tok=0, out_tok=0, error=NULL WHERE id=?",
+             "confirmed" if ok else "rejected", "claude-code", json.dumps(v, ensure_ascii=False), str(frag), r["id"])
+        done += 1
+        print(f"  {'✔' if ok else '✘'} id {cid} {r['name']} стр. {r['page']} {r['target']}")
+    print(f"Применено вердиктов: {done}. Дальше: poisk.py report")
+
+
 def group_by(rows, key):
     out = {}
     for r in rows:
@@ -663,6 +740,14 @@ def main():
     v.add_argument("--min-certainty", choices=["low", "medium", "high"], default="low")
     v.add_argument("--again", action="store_true", help="перепроверить и уже подтверждённых (например, чтобы заполнить новые колонки)")
 
+    x = sub.add_parser("review-export", help="выгрузить кандидатов картинками для проверки в Claude Code (без API)")
+    x.add_argument("--scan-model")
+    x.add_argument("--doc")
+    x.add_argument("--limit", type=int)
+    x.add_argument("--again", action="store_true", help="включить и уже проверенных")
+
+    sub.add_parser("review-import", help="загрузить вердикты.json, заполненный в Claude Code")
+
     r = sub.add_parser("report", help="находки.xlsx, находки.csv и находки.md")
     r.add_argument("--model", help="модель поиска (по умолчанию из config)")
     r.add_argument("--all", action="store_true", help="включить отклонённые (колонка «статус»)")
@@ -683,7 +768,7 @@ def main():
     args = ap.parse_args()
     cfg = load_config(args.config)
     st = Store(cfg["work"] / "poisk.db")
-    {"scan": cmd_scan, "collect": cmd_collect, "verify": cmd_verify, "report": cmd_report,
+    {"scan": cmd_scan, "collect": cmd_collect, "verify": cmd_verify, "review-export": cmd_review_export, "review-import": cmd_review_import, "report": cmd_report,
      "eval": cmd_eval, "transcribe": cmd_transcribe, "status": cmd_status}[args.cmd](cfg, st, args)
 
 
