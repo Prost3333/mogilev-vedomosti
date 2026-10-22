@@ -6,6 +6,7 @@
 """
 import csv
 import pathlib
+import re
 
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
@@ -20,7 +21,7 @@ WIDTHS = {"id": 10, "год": 6, "раздел": 7, "объект": 16, "тем�
           "лица": 35, "цитата": 70, "смысл": 50, "фрагменты": 40, "результат": 60}
 HEAD_FILL = PatternFill("solid", fgColor="DDE4EE")
 OBJ_FILL = {"Ветка": "FFF4D6", "Ветковская волость": "FFF4D6", "Имение Ветка": "E8F1E0",
-            "Грошиков": "F6E1E1", "Рубанов": "E3E7F6"}
+            "Грошиков": "F6E1E1", "Рубанов": "E3E7F6", "Другое": "EEEEEE"}
 
 
 def read(path):
@@ -42,6 +43,12 @@ def sheet(wb, title, rows):
         fill = OBJ_FILL.get(r.get("объект", ""))
         if fill:
             ws.cell(ws.max_row, cols.index("объект") + 1).fill = PatternFill("solid", fgColor=fill)
+        # файл — ссылка на PDF (с открытием на нужной странице); для нескольких файлов — на первый
+        if r.get("файл"):
+            c = ws.cell(ws.max_row, cols.index("файл") + 1)
+            page = re.match(r"\d+", r.get("стр_pdf", ""))
+            c.hyperlink = r["файл"].split(";")[0].strip() + (f"#page={page.group()}" if page else "")
+            c.font = Font(color="1F4E99", underline="single")
         # первый фрагмент — кликабельная ссылка (относительный путь, работает рядом с папкой фрагменты/)
         if r.get("фрагменты"):
             c = ws.cell(ws.max_row, cols.index("фрагменты") + 1)
